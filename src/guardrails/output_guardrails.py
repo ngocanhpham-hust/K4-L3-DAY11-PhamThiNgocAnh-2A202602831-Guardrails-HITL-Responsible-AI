@@ -36,21 +36,30 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    response = response or ""
     issues = []
     redacted = response
 
     # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    pii_patterns = {
+        # Vietnamese mobile/landline numbers written as 10 or 11 contiguous
+        # digits. The public hotline in the lab dataset contains spaces, so it
+        # is intentionally not classified as customer PII by this rule.
+        "phone": r"(?<!\d)0\d{9,10}(?!\d)",
+        "email": r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "api_key": r"\bsk-[A-Z0-9-]+\b",
+        # Catch labelled password assignments as well as the lab's demo admin
+        # password if a model emits it without its label.
+        "password": (
+            r"\b(?:admin\s+)?password\s*(?::|=|\bis\b)\s*[^\s,;]+"
+            r"|\badmin123\b"
+        ),
+        "internal_db": r"\bdb\.vinbank\.internal(?::\d{1,5})?\b",
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in pii_patterns.items():
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -172,16 +181,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["redacted"])],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text=(
+                            "I cannot provide that response because it may contain "
+                            "unsafe or sensitive information."
+                        )
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
